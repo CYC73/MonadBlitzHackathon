@@ -1,158 +1,290 @@
 "use client";
 
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { ConnectButton } from "@rainbow-me/rainbowkit";
+import { useReadContract, useWriteContract } from "wagmi";
+import { parseEther } from "viem";
+import MonadStreamABI from "../MonadStream.json"; 
+
+const CONTRACT_ADDRESS = "0xd325B3f6bB0CC0bd130959A429F0F36E365581B5"; 
+
+interface Message {
+  id: string;
+  sender: "user" | "ai" | "system";
+  text: string;
+  model?: string;
+}
 
 export default function Home() {
-  // State variables for the hackathon simulation
-  const [isLooping, setIsLooping] = useState(false);
-  const [budget, setBudget] = useState(100.0); // Starts at 100%
-  const [aiStatus, setAiStatus] = useState<"NORMAL" | "RUNAWAY" | "FALLBACK">("NORMAL");
-  const [logs, setLogs] = useState<string[]>(["[System]: Guard system initialized. Monitoring AI budget..."]);
+  const { writeContractAsync } = useWriteContract();
+  const messagesEndRef = useRef<HTMLDivElement>(null);
 
-  // Simulate high frequency requests when "Infinite Loop Button" is pushed
+  // 1. 真实读取链上合约的剩余预算
+  const { data: onChainBudget, refetch: refetchBudget } = useReadContract({
+    address: CONTRACT_ADDRESS,
+    abi: MonadStreamABI.abi,
+    functionName: "getRemainingBudget",
+  });
+
+  // 2. 真实读取链上合约是否已经熔断
+  const { data: isContractFrozen, refetch: refetchFrozen } = useReadContract({
+    address: CONTRACT_ADDRESS,
+    abi: MonadStreamABI.abi,
+    functionName: "isFrozen",
+  });
+
+  const [budget, setBudget] = useState(0.0);
+  const [customPrompt, setCustomPrompt] = useState("");
+  const [isSending, setIsSending] = useState(false);
+  const [isLooping, setIsLooping] = useState(false);
+  const [aiStatus, setAiStatus] = useState<"NORMAL" | "RUNAWAY" | "FALLBACK">("NORMAL");
+  const [chatHistory, setChatHistory] = useState<Message[]>([
+    { id: "1", sender: "system", text: "🛜 Monad x402 AI Settle Gateway synchronized successfully. System is live." }
+  ]);
+
+  // 同步链上预算
+  useEffect(() => {
+    if (onChainBudget !== undefined) {
+      const formattedBudget = Number(onChainBudget) / 1e18;
+      setBudget(formattedBudget);
+
+      if (formattedBudget <= 0 || isContractFrozen) {
+        setIsLooping(false);
+        setAiStatus("FALLBACK");
+      } else if (isLooping) {
+        setAiStatus("RUNAWAY");
+      } else {
+        setAiStatus("NORMAL");
+      }
+    }
+  }, [onChainBudget, isContractFrozen, isLooping]);
+
+  // 自动滚动到聊天底部
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [chatHistory]);
+
+  // -------------------------------------------------------------
+  // 🧠 ChatGPT 经典发送逻辑：真联网 + x402 弹窗拦截扣费
+  // -------------------------------------------------------------
+  async function handleSendPrompt() {
+    if (!customPrompt.trim() || isSending) return;
+    
+    const userQuery = customPrompt;
+    setChatHistory((prev) => [...prev, { id: Date.now().toString(), sender: "user", text: userQuery }]);
+    setCustomPrompt("");
+    setIsSending(true);
+
+    try {
+      // 🚀 第一次冲锋
+      let response = await fetch("/api/agent", {
+        method: "POST",
+        body: JSON.stringify({ userPrompt: userQuery }),
+      });
+
+      let result = await response.json();
+
+      // 🚨 触发 x402 拦截
+      if (response.status === 402) {
+        setChatHistory((prev) => [...prev, { 
+          id: Date.now().toString(), 
+          sender: "system", 
+          text: "⚠️ [x402 Intercept]: Heavy Analysis Detected. Invoking Monad transaction for 0.01 MON..." 
+        }]);
+
+        // 唤起小狐狸付钱买单
+        const tx = await writeContractAsync({
+          address: CONTRACT_ADDRESS,
+          abi: MonadStreamABI.abi,
+          functionName: "topUpBudget",
+          value: parseEther("0.01"),
+        });
+
+        setChatHistory((prev) => [...prev, { 
+          id: Date.now().toString(), 
+          sender: "system", 
+          text: `🔗 [MetaMask Signed]: Hash ${tx.substring(0, 12)}... Validating ticket on-chain...` 
+        }]);
+
+        // 🎫 第二次请求
+        response = await fetch("/api/agent", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "X-PAYMENT": tx },
+          body: JSON.stringify({ userPrompt: userQuery }),
+        });
+        
+        result = await response.json();
+      }
+
+      // 推入 AI 的真实解答气泡
+      setChatHistory((prev) => [...prev, { 
+        id: Date.now().toString(), 
+        sender: "ai", 
+        text: result.answer,
+        model: result.aiModelUsed
+      }]);
+      
+      refetchBudget();
+      refetchFrozen();
+
+    } catch (e) {
+      console.error(e);
+      setChatHistory((prev) => [...prev, { id: Date.now().toString(), sender: "system", text: "❌ Interaction rejected or node connection error." }]);
+    } finally {
+      setIsSending(false);
+    }
+  }
+
+  // 原本的高频恶意循环测试按钮（保留作为后手演示）
   useEffect(() => {
     let interval: NodeJS.Timeout;
     if (isLooping && budget > 0) {
-      setAiStatus("RUNAWAY");
       interval = setInterval(async () => {
-        // 1. Visually plunge the budget quickly
-        setBudget((prev) => {
-          const nextBudget = +(prev - Math.random() * 4).toFixed(2);
-          if (nextBudget <= 0) {
-            setIsLooping(false);
-            setAiStatus("FALLBACK");
-            setLogs((l) => ["[CRITICAL]: On-chain budget exhausted!熔断!", "[Fallback]: Switched to local Llama-3 free model.", ...l]);
-            return 0;
-          }
-          return nextBudget;
-        });
-
-        // 2. Add realistic logs for presentation effect
-        setLogs((l) => [
-          `[Agent - GPT-4]: Processing rogue request loop # ${Math.floor(Math.random() * 1000)}... (Charging Monad Contract)`,
-          ...l,
-        ]);
-
-        // 3. Trigger Member C's background proxy (Uncomment this after 2:30 PM once Member C code is ready)
-        /*
+        const mockPrompt = `Rogue agent rapid script check ${Math.floor(Math.random() * 100)}`;
         try {
-          await fetch("/api/agent", { method: "POST" });
-        } catch (e) {
-          console.error(e);
-        }
-        */
-      }, 400); // 400ms high-frequency blast
+          let response = await fetch("/api/agent", {
+            method: "POST",
+            body: JSON.stringify({ userPrompt: mockPrompt }),
+          });
+          if (response.status === 402) {
+            const tx = await writeContractAsync({
+              address: CONTRACT_ADDRESS,
+              abi: MonadStreamABI.abi,
+              functionName: "topUpBudget",
+              value: parseEther("0.01"),
+            });
+            response = await fetch("/api/agent", {
+              method: "POST",
+              headers: { "Content-Type": "application/json", "X-PAYMENT": tx },
+              body: JSON.stringify({ userPrompt: mockPrompt }),
+            });
+          }
+          refetchBudget();
+          refetchFrozen();
+        } catch (e) {}
+      }, 1200);
     }
     return () => clearInterval(interval);
-  }, [isLooping, budget]);
+  }, [isLooping, budget, writeContractAsync, refetchBudget, refetchFrozen]);
 
   return (
-    <div className="min-h-screen bg-zinc-950 p-8 text-zinc-100 flex flex-col justify-between">
-      {/* Navbar */}
-      <header className="flex justify-between items-center border-b border-zinc-800 pb-4">
-        <div>
-          <h1 className="text-xl font-bold tracking-wider text-purple-400">🤖 MONAD AI GUARD</h1>
-          <p className="text-xs text-zinc-500">Autonomous Budget Circuit-Breaker</p>
+    <div className="min-h-screen bg-zinc-950 text-zinc-100 flex flex-col h-screen font-sans relative overflow-hidden">
+      
+      {/* 🟢 TOP NAVBAR */}
+      <header className="flex justify-between items-center px-8 py-4 border-b border-zinc-900 bg-zinc-950/80 backdrop-blur shrink-0 z-10">
+        <div className="flex items-center gap-3">
+          <span className="text-xl">🤖</span>
+          <div>
+            <h1 className="text-sm font-bold tracking-wider text-zinc-200">MONAD AI HUB</h1>
+            <p className="text-[10px] text-purple-400 font-mono tracking-tight">Autonomous Multi-Model Multi-Route Gateway</p>
+          </div>
         </div>
-        <ConnectButton />
+        <div className="flex items-center gap-4">
+          {/* Workload Badge */}
+          <div className="flex items-center gap-2 bg-zinc-900 px-3 py-1.5 rounded-lg border border-zinc-800 text-[11px] font-mono">
+            <span className={`h-2 w-2 rounded-full ${aiStatus === "NORMAL" ? "bg-emerald-500 animate-pulse" : aiStatus === "RUNAWAY" ? "bg-rose-500 animate-ping" : "bg-cyan-400"}`} />
+            {aiStatus === "NORMAL" && <span className="text-emerald-400">Intelligent Routing</span>}
+            {aiStatus === "RUNAWAY" && <span className="text-rose-500">Rogue Attack</span>}
+            {aiStatus === "FALLBACK" && <span className="text-cyan-400">Circuit Breaker</span>}
+          </div>
+          <ConnectButton />
+        </div>
       </header>
 
-      {/* Main Grid Workspace */}
-      <main className="grid grid-cols-1 md:grid-cols-2 gap-8 my-auto max-w-6xl w-full mx-auto">
+      {/* 🟢 CENTER WORKSPACE: 100% PURE CHATGPT WINDOW */}
+      <div className="flex-1 flex flex-col overflow-hidden w-full max-w-4xl mx-auto px-4 relative pb-24">
         
-        {/* Left Side: Water Meter Dashboard */}
-        <div className="bg-zinc-900/50 p-6 rounded-2xl border border-zinc-800 backdrop-blur flex flex-col justify-between h-[340px]">
-          <div>
-            <h2 className="text-sm font-semibold tracking-wide uppercase text-zinc-400">On-Chain Remaining Budget</h2>
-            <div className="mt-6 flex items-baseline">
-              <span className={`text-7xl font-extrabold tracking-tighter transition-all duration-100 ${
-                budget > 30 ? "text-emerald-400" : budget > 0 ? "text-amber-500 animate-pulse" : "text-rose-500"
+        {/* Chat History Flow Container */}
+        <div className="flex-1 overflow-y-auto py-8 space-y-6 scrollbar-none pr-2">
+          {chatHistory.map((msg) => (
+            <div 
+              key={msg.id} 
+              className={`flex flex-col w-full ${
+                msg.sender === "user" ? "items-end" : msg.sender === "system" ? "items-center my-3" : "items-start"
+              }`}
+            >
+              {/* Model Tag Assigned Indicator */}
+              {msg.model && (
+                <div className="flex items-center gap-1.5 text-[10px] font-mono text-zinc-500 mb-1.5 ml-4">
+                  <span className={`h-1.5 w-1.5 rounded-full ${msg.model.includes("Live") ? "bg-emerald-400" : "bg-purple-400"}`} />
+                  Gateway Assigned: <span className={msg.model.includes("Live") ? "text-emerald-400" : "text-purple-400 font-bold"}>{msg.model}</span>
+                </div>
+              )}
+
+              {/* Chat Bubble Structure */}
+              <div className={`max-w-[80%] px-4 py-3 text-sm leading-relaxed rounded-2xl shadow-md ${
+                msg.sender === "user" 
+                  ? "bg-purple-600 text-white rounded-tr-none font-medium" 
+                  : msg.sender === "system"
+                  ? "bg-zinc-900/30 text-zinc-500 text-xs font-mono border border-zinc-900/60 py-1.5 text-center max-w-full w-full rounded-xl"
+                  : "bg-zinc-900 text-zinc-100 rounded-tl-none border border-zinc-800/80"
               }`}>
-                {budget}
-              </span>
-              <span className="text-2xl font-bold text-zinc-500 ml-2">MON</span>
-            </div>
-          </div>
-
-          {/* Progress Bar */}
-          <div className="mt-auto">
-            <div className="w-full bg-zinc-800 h-4 rounded-full overflow-hidden">
-              <div 
-                className={`h-full transition-all duration-100 ${
-                  budget > 50 ? "bg-emerald-500" : budget > 15 ? "bg-amber-500" : "bg-rose-600"
-                }`}
-                style={{ width: `${budget}%` }}
-              />
-            </div>
-            <div className="flex justify-between text-xs text-zinc-500 mt-2">
-              <span>0.00 MON (Breaker Point)</span>
-              <span>100.00 MON Limit</span>
-            </div>
-          </div>
-        </div>
-
-        {/* Right Side: Status Display Lights & Controls */}
-        <div className="bg-zinc-900/50 p-6 rounded-2xl border border-zinc-800 backdrop-blur flex flex-col justify-between h-[340px]">
-          <div>
-            <h2 className="text-sm font-semibold tracking-wide uppercase text-zinc-400">AI Gateway Core Engine</h2>
-            
-            {/* Dynamic Status Light Section */}
-            <div className="mt-6 flex items-center gap-4 bg-zinc-950 p-4 rounded-xl border border-zinc-800">
-              <span className={`relative flex h-4 w-4`}>
-                <span className={`animate-ping absolute inline-flex h-full w-full rounded-full opacity-75 ${
-                  aiStatus === "NORMAL" ? "bg-emerald-400" : aiStatus === "RUNAWAY" ? "bg-rose-500" : "bg-cyan-400"
-                }`}></span>
-                <span className={`relative inline-flex rounded-full h-4 w-4 ${
-                  aiStatus === "NORMAL" ? "bg-emerald-500" : aiStatus === "RUNAWAY" ? "bg-rose-600" : "bg-cyan-500"
-                }`}></span>
-              </span>
-              <div>
-                <p className="text-xs text-zinc-500 font-mono">CURRENT WORKLOAD STATUS</p>
-                <p className="text-md font-bold tracking-wide">
-                  {aiStatus === "NORMAL" && <span className="text-emerald-400">GPT-4 Engine: Normal Operations</span>}
-                  {aiStatus === "RUNAWAY" && <span className="text-rose-500 animate-pulse">CRITICAL: Rogue AI Loop Detected!</span>}
-                  {aiStatus === "FALLBACK" && <span className="text-cyan-400">🔒 LIQUIDATION BREAKER: Llama-3 Active</span>}
-                </p>
+                {msg.text}
               </div>
             </div>
-          </div>
-
-          {/* Core Action Trigger */}
-          <button
-            onClick={() => {
-              if (budget <= 0) {
-                setBudget(100);
-                setAiStatus("NORMAL");
-                setLogs((l) => ["[System]: Budget refilled for next test run.", ...l]);
-              } else {
-                setIsLooping(!isLooping);
-              }
-            }}
-            className={`w-full py-4 px-6 rounded-xl font-bold tracking-wide uppercase transition-all shadow-lg active:scale-[0.98] ${
-              budget <= 0 
-                ? "bg-zinc-800 hover:bg-zinc-700 text-zinc-200"
-                : isLooping 
-                ? "bg-zinc-100 hover:bg-zinc-200 text-zinc-950" 
-                : "bg-rose-600 hover:bg-rose-500 text-white shadow-rose-900/30"
-            }`}
-          >
-            {budget <= 0 ? "🔄 Reset Hackathon Demo" : isLooping ? "⏸️ Pause Rogue Loop Simulation" : "🔥 Trigger Rogue AI Infinite Loop"}
-          </button>
-        </div>
-      </main>
-
-      {/* Live Logs Panel for Judge presentation */}
-      <footer className="mt-8 border-t border-zinc-900 pt-4 max-w-6xl w-full mx-auto">
-        <p className="text-xs font-mono text-zinc-500 mb-2">🔴 REAL-TIME TRANSACTION LOGS (HACKATHON EVENT STREAM)</p>
-        <div className="bg-zinc-950/80 border border-zinc-900 p-4 rounded-xl font-mono text-xs text-zinc-400 h-32 overflow-y-auto flex flex-col gap-1 select-none">
-          {logs.map((log, index) => (
-            <div key={index} className={log.includes("CRITICAL") ? "text-rose-500 font-bold" : log.includes("System") ? "text-purple-400" : ""}>
-              {log}
-            </div>
           ))}
+          <div ref={messagesEndRef} />
         </div>
-      </footer>
+
+        {/* Bottom Dock Box Container */}
+        <div className="absolute bottom-0 left-0 right-0 p-4 bg-gradient-to-t from-zinc-950 via-zinc-950 to-transparent pt-10">
+          <div className="relative flex items-center bg-zinc-900 border border-zinc-800/80 rounded-2xl focus-within:border-purple-500/80 shadow-2xl transition-all px-4 py-3">
+            <input
+              type="text"
+              value={customPrompt}
+              onChange={(e) => setCustomPrompt(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && handleSendPrompt()}
+              placeholder="Ask Monad Gateway Anything... (e.g., 'Say hello' or 'analyze smart contract')"
+              disabled={isSending}
+              className="flex-1 bg-transparent text-sm text-zinc-100 focus:outline-none placeholder-zinc-600 disabled:opacity-50"
+            />
+            <button
+              onClick={handleSendPrompt}
+              disabled={isSending || !customPrompt.trim()}
+              className="bg-purple-600 hover:bg-purple-500 disabled:bg-zinc-800 disabled:text-zinc-600 text-white px-4 py-1.5 rounded-xl text-xs font-bold transition-all shadow-md active:scale-95"
+            >
+              {isSending ? "..." : "Send"}
+            </button>
+          </div>
+          <p className="text-[10px] text-center text-zinc-600 font-mono mt-2.5">
+            💡 Sandbox Rules: Casual prompts use free Llama-3. Prompts containing 'analyze', 'audit', or 'contract' trigger x402 native payment gate.
+          </p>
+        </div>
+      </div>
+
+      {/* 🟢 RIGHT-BOTTOM FLOATING PANEL (悬浮窗：收纳钱包、链上合约数据与演示控制) */}
+      <div className="absolute bottom-6 right-6 w-72 bg-zinc-900/95 border border-zinc-800/80 rounded-2xl p-4 shadow-2xl backdrop-blur-md z-20 flex flex-col gap-3">
+        <div className="flex justify-between items-center border-b border-zinc-800 pb-2">
+          <span className="text-[11px] font-mono font-bold text-zinc-400">🔗 MONAD LEDGER CONSOLE</span>
+          <span className="h-2 w-2 rounded-full bg-emerald-400 animate-pulse" />
+        </div>
+        
+        {/* On-Chain Wallet Balance */}
+        <div>
+          <p className="text-[10px] text-zinc-500 font-mono uppercase tracking-wide">Contract Budget Pool</p>
+          <div className="flex items-baseline mt-1">
+            <span className="text-2xl font-black text-emerald-400 font-mono tracking-tight">{budget.toFixed(4)}</span>
+            <span className="text-xs font-bold text-zinc-500 ml-1">MON</span>
+          </div>
+          <p className="text-[8px] text-zinc-600 font-mono select-all truncate mt-0.5">📍 {CONTRACT_ADDRESS}</p>
+        </div>
+
+        {/* Attack Demo Backdoor Button */}
+        <button
+          onClick={() => {
+            if (budget <= 0 || isContractFrozen) return;
+            setIsLooping(!isLooping);
+          }}
+          className={`w-full py-2 px-3 rounded-xl text-[10px] font-bold uppercase tracking-wide transition-all active:scale-[0.97] ${
+            isLooping 
+              ? "bg-zinc-100 hover:bg-zinc-200 text-zinc-950" 
+              : "bg-rose-600/20 text-rose-400 hover:bg-rose-600/30 border border-rose-500/30"
+          }`}
+        >
+          {isLooping ? "⏸️ Stop Loop Simulation" : "🔥 Trigger Rogue Loop Attack"}
+        </button>
+      </div>
+
     </div>
   );
 }

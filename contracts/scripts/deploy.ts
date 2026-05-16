@@ -21,6 +21,7 @@ async function main() {
   
   console.log(" setting up to Monad");
   const contract = await factory.deploy({
+    gasLimit: 5000000,
     value: ethers.parseEther("0.01") // 部署时自动充值 0.01 MON 激活合约
   });
 
